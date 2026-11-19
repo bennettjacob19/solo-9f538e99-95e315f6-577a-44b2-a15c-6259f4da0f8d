@@ -8,12 +8,15 @@ import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from functools import partial
+from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
 
+from .preflight import PreflightError, preflight
 from .sample_image import build_sample_image
+from .sample_mounts import sample_mount_spec_json
 from .unpacker import CHUNK, UnpackError, unpack_image
 
 logger = logging.getLogger("oci-unpacker")
@@ -48,7 +51,11 @@ app = FastAPI(
         "* hardlink overwrite is byte-safe for the other end;\n"
         "* paths and links can never escape the per-request sandbox;\n"
         "* any missing/corrupt/illegal input fails the whole request.\n\n"
-        "Try it: download `GET /sample-image`, then upload it to `POST /unpack`."
+        "Try it: download `GET /sample-image`, then upload it to `POST /unpack`.\n\n"
+        "`POST /preflight` rebuilds the same rootfs, applies the ConfigMap "
+        "volume mounts described by the uploaded Pod JSON and reports the "
+        "SHA-256 and origin of each requested absolute path before and after "
+        "the mounts."
     ),
     lifespan=lifespan,
 )
@@ -61,7 +68,9 @@ def root():
         "docs": "/docs",
         "endpoints": {
             "unpack": "POST /unpack",
+            "preflight": "POST /preflight",
             "sample_image": "GET /sample-image",
+            "sample_mounts": "GET /sample-mounts",
             "healthz": "GET /healthz",
         },
     }
@@ -85,6 +94,17 @@ def sample_image():
     return FileResponse(
         SAMPLE_IMAGE_PATH, media_type="application/x-tar", filename="sample-image.tar"
     )
+
+
+@app.get(
+    "/sample-mounts",
+    summary="Download the mount spec that pairs with the sample image",
+    response_description="sample-mounts.json -- Pod, ConfigMap and volumeMounts "
+    "JSON plus the absolute paths to look up",
+    responses={200: {"content": {"application/json": {}}}},
+)
+def sample_mounts():
+    return Response(sample_mount_spec_json(), media_type="application/json")
 
 
 @app.post(
@@ -125,3 +145,58 @@ def unpack(
         filename="rootfs.tar",
         background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
     )
+
+
+@app.post(
+    "/preflight",
+    summary="Check ConfigMap mounts against an OCI image, before configuring them",
+    response_description="Per-path SHA-256 and origin before and after the mounts",
+    responses={
+        200: {"content": {"application/json": {}}},
+        400: {
+            "description": "Invalid mount spec/image, or an unresolved "
+            "reference, projection conflict, overlapping mount points, type "
+            "mismatch or symlinked mount path."
+        },
+    },
+)
+def preflight_endpoint(
+    file: UploadFile = File(
+        ..., description="OCI Image Layout tar containing exactly one manifest"
+    ),
+    mounts: Optional[str] = Form(
+        None,
+        description="Mount spec JSON (Pod, ConfigMaps, volumeMounts and the "
+        "absolute paths to look up), pasted as a form field. Alternatively "
+        "upload it as `mounts_file`.",
+    ),
+    mounts_file: Optional[UploadFile] = File(
+        None,
+        description="The same mount spec JSON uploaded as a file "
+        "(e.g. sample-mounts.json from GET /sample-mounts).",
+    ),
+):
+    if mounts_file is not None:
+        spec_raw = mounts_file.file.read()
+    elif mounts is not None:
+        spec_raw = mounts.encode("utf-8")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="missing mount spec: send the JSON in the 'mounts' form "
+            "field or upload it as 'mounts_file'",
+        )
+    work = tempfile.mkdtemp(prefix="req-", dir=WORK_ROOT)
+    try:
+        upload_path = os.path.join(work, "upload.tar")
+        with open(upload_path, "wb") as out:
+            shutil.copyfileobj(file.file, out, CHUNK)
+        result = preflight(upload_path, spec_raw, work)
+    except (UnpackError, PreflightError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("unexpected error during preflight")
+        raise HTTPException(status_code=500, detail="internal error")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return JSONResponse(result)

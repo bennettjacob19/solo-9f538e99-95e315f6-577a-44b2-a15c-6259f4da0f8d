@@ -344,7 +344,21 @@ def _apply_meta(path, member, is_link):
         pass
 
 
-def _apply_entry(tf, member, rel, rootfs, dir_meta):
+def _record_origin(dest, origin, layer):
+    """Remember which layer wrote the bytes now reachable at *dest*.
+
+    Origins are keyed by inode, not by path: after one end of a hardlink is
+    overwritten (a new inode is created by rename) the other end still
+    resolves to the original inode and therefore the original layer.
+    """
+    if origin is None or layer is None:
+        return
+    st = os.lstat(dest)
+    if stat.S_ISREG(st.st_mode):
+        origin[(st.st_dev, st.st_ino)] = layer
+
+
+def _apply_entry(tf, member, rel, rootfs, dir_meta, origin=None, layer=None):
     dest = _resolve_within(rootfs, rel)
     parent = os.path.dirname(dest)
 
@@ -377,11 +391,13 @@ def _apply_entry(tf, member, rel, rootfs, dir_meta):
             if os.path.lexists(tmp):
                 os.unlink(tmp)
         _apply_meta(dest, member, is_link=False)
+        _record_origin(dest, origin, layer)
     elif member.issym():
         _check_link_target(rootfs, parent, member.linkname)
         _remove_existing(dest)
         os.symlink(member.linkname, dest)
         _apply_meta(dest, member, is_link=True)
+        _record_origin(dest, origin, layer)
     elif member.islnk():
         tparts = _normalize_archive_name(member.linkname, f"hardlink target of {rel!r}")
         if not tparts:
@@ -397,10 +413,13 @@ def _apply_entry(tf, member, rel, rootfs, dir_meta):
         except OSError as e:
             raise UnpackError(f"hardlink {rel!r}: {e}")
         _apply_meta(dest, member, is_link=False)
+        # Do not record the layer here: a hardlink does not write new bytes,
+        # so both names must keep reporting the layer of the original file.
     elif member.isfifo():
         _remove_existing(dest)
         os.mkfifo(dest, member.mode & 0o7777)
         _apply_meta(dest, member, is_link=False)
+        _record_origin(dest, origin, layer)
     elif member.ischr() or member.isblk():
         _remove_existing(dest)
         mode = (stat.S_IFCHR if member.ischr() else stat.S_IFBLK) | (member.mode & 0o7777)
@@ -409,6 +428,7 @@ def _apply_entry(tf, member, rel, rootfs, dir_meta):
         except PermissionError:
             return  # device nodes need privileges; skip when unprivileged
         _apply_meta(dest, member, is_link=False)
+        _record_origin(dest, origin, layer)
     else:
         raise UnpackError(f"unsupported entry type {member.type!r} for {rel!r}")
 
@@ -418,7 +438,7 @@ def _apply_entry(tf, member, rel, rootfs, dir_meta):
 # ---------------------------------------------------------------------------
 
 
-def apply_layer(tar_path, rootfs, dir_meta):
+def apply_layer(tar_path, rootfs, dir_meta, origin=None, layer=None):
     try:
         tf = tarfile.open(tar_path, "r:")
     except (tarfile.TarError, OSError) as e:
@@ -465,7 +485,9 @@ def apply_layer(tar_path, rootfs, dir_meta):
         # Phase 2: write this layer's new content in tar order.
         for m, parts in entries:
             try:
-                _apply_entry(tf, m, "/".join(parts), rootfs, dir_meta)
+                _apply_entry(
+                    tf, m, "/".join(parts), rootfs, dir_meta, origin=origin, layer=layer
+                )
             except UnpackError:
                 raise
             except (OSError, ValueError, tarfile.TarError) as e:
@@ -564,6 +586,20 @@ def unpack_image(upload_path, workdir):
 
     Raises UnpackError on any problem; nothing is returned in that case.
     """
+    rootfs, origin = restore_image(upload_path, workdir)
+
+    out_path = os.path.join(workdir, "rootfs.tar")
+    build_rootfs_tar(rootfs, out_path)
+    return out_path
+
+
+def restore_image(upload_path, workdir):
+    """Verify the uploaded layout tar and rebuild the rootfs directory.
+
+    Shared by ``/unpack`` and the ``/preflight`` mount check.  Returns
+    ``(rootfs_dir, origin)`` where *origin* maps ``(st_dev, st_ino)`` of
+    every regular file to its 1-based layer number in the manifest.
+    """
     layout_dir = os.path.join(workdir, "layout")
     os.makedirs(layout_dir)
     extract_layout(upload_path, layout_dir)
@@ -572,10 +608,8 @@ def unpack_image(upload_path, workdir):
     rootfs = os.path.join(workdir, "rootfs")
     os.makedirs(rootfs)
     dir_meta = {}
-    for tar_path in layer_tars:
-        apply_layer(tar_path, rootfs, dir_meta)
+    origin = {}
+    for index, tar_path in enumerate(layer_tars, start=1):
+        apply_layer(tar_path, rootfs, dir_meta, origin=origin, layer=index)
     _apply_deferred_dir_meta(dir_meta)
-
-    out_path = os.path.join(workdir, "rootfs.tar")
-    build_rootfs_tar(rootfs, out_path)
-    return out_path
+    return rootfs, origin
